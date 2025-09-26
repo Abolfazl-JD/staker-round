@@ -71,7 +71,6 @@ docker compose down -v
 
 ## Feedback
 
-I’m always looking to **improve my code and approach**.  
-Feedback and results are appreciated, even if they are negative.
+I’m always looking to **improve my code and approach**.
 
-    This helps improve the project and ensures reproducibility.
+    Feedback and results are appreciated, even if they are negative
