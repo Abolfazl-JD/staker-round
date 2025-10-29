@@ -1,192 +1,216 @@
 import {
-  Injectable,
-  NotAcceptableException,
-  NotFoundException,
-  UnprocessableEntityException,
-} from '@nestjs/common';
-import { UsersService } from 'src/users/users.service';
-import { TransactionsRepository } from './transactions.repository';
-import { Transaction } from './entities/transaction.entity';
-import { EntityManager } from 'typeorm';
-import { AdminService } from 'src/admin/admin.service';
-import { BigNumber } from 'bignumber.js';
-import { isNil, MutexService } from 'src/common';
-import { CreateTransactionDto, UpdateTransactionStatusDto } from './dto';
-import { Status, TransactionType } from './enums';
+    Injectable,
+    NotAcceptableException,
+    NotFoundException,
+    UnprocessableEntityException,
+} from "@nestjs/common";
+import { UsersService } from "src/users/users.service";
+import { TransactionsRepository } from "./transactions.repository";
+import { Transaction } from "./entities/transaction.entity";
+import { EntityManager } from "typeorm";
+import { AdminService } from "src/admin/admin.service";
+import { BigNumber } from "bignumber.js";
+import { isNil, MutexService } from "src/common";
+import { CreateTransactionDto, UpdateTransactionStatusDto } from "./dto";
+import { Status, TransactionType } from "./enums";
 
 @Injectable()
 export class TransactionsService {
-  constructor(
-    private readonly repo: TransactionsRepository,
-    private readonly usersService: UsersService,
-    private readonly adminService: AdminService,
-    private readonly mutexService: MutexService,
-  ) {}
+    constructor(
+        private readonly repo: TransactionsRepository,
+        private readonly usersService: UsersService,
+        private readonly adminService: AdminService,
+        private readonly mutexService: MutexService,
+    ) {}
 
-  async create(userId: number, dto: CreateTransactionDto) {
-    return this.mutexService.performExclusively(`user-${userId}`, async () => {
-      const { amount, type } = dto;
-      const user = await this.usersService.findById(userId);
-      if (isNil(user)) throw new NotFoundException('User not found');
+    async create(userId: number, dto: CreateTransactionDto) {
+        return this.mutexService.performExclusively(
+            `user-${userId}`,
+            async () => {
+                const { amount, type } = dto;
+                const user = await this.usersService.findById(userId);
+                if (isNil(user)) throw new NotFoundException("User not found");
 
-      const userPendingTransactions = await this.getUserTransactions(
-        userId,
-        Status.PENDING,
-      );
+                const userPendingTransactions = await this.getUserTransactions(
+                    userId,
+                    Status.PENDING,
+                );
 
-      if (userPendingTransactions.length) {
-        throw new NotAcceptableException(
-          'User already has a pending transaction',
+                if (userPendingTransactions.length) {
+                    throw new NotAcceptableException(
+                        "User already has a pending transaction",
+                    );
+                }
+
+                if (dto.type === "WITHDRAWAL") {
+                    const balance = new BigNumber(user.balance);
+                    if (balance.lt(amount)) {
+                        throw new UnprocessableEntityException(
+                            "Insufficient balance",
+                        );
+                    }
+                }
+
+                const transaction = this.repo.create({
+                    type:
+                        type === "DEPOSIT"
+                            ? TransactionType.DEPOSIT
+                            : TransactionType.WITHDRAWAL,
+                    amount,
+                    userId,
+                });
+
+                return transaction;
+            },
         );
-      }
+    }
 
-      if (dto.type === 'WITHDRAWAL') {
-        const balance = new BigNumber(user.balance);
-        if (balance.lt(amount)) {
-          throw new UnprocessableEntityException('Insufficient balance');
-        }
-      }
+    getUserTransactions(userId: number, status: Status) {
+        return this.repo.getUserTransactions(userId, status);
+    }
 
-      const transaction = this.repo.create({
-        type:
-          type === 'DEPOSIT'
-            ? TransactionType.DEPOSIT
-            : TransactionType.WITHDRAWAL,
-        amount,
-        userId,
-      });
+    getAllTransactions(status: Status) {
+        return this.repo.getAllTransactions(status);
+    }
 
-      return transaction;
-    });
-  }
+    getTransactionById(transactionId: number) {
+        return this.repo.getUserTransactionById(transactionId);
+    }
 
-  getUserTransactions(userId: number, status: Status) {
-    return this.repo.getUserTransactions(userId, status);
-  }
+    async updateTransactionStatus(
+        dto: UpdateTransactionStatusDto,
+        transactionId: number,
+        modifierAdminId: number,
+    ) {
+        return this.mutexService.performExclusively(
+            `update-transaction-${transactionId}`,
+            async () => {
+                const { newStatus } = dto;
 
-  getAllTransactions(status: Status) {
-    return this.repo.getAllTransactions(status);
-  }
+                await this.repo.runTransaction(async (manager) => {
+                    const transaction =
+                        await this.getTransactionById(transactionId);
 
-  getTransactionById(transactionId: number) {
-    return this.repo.getUserTransactionById(transactionId);
-  }
+                    if (isNil(transaction)) {
+                        throw new NotFoundException("Transaction not found");
+                    }
 
-  async updateTransactionStatus(
-    dto: UpdateTransactionStatusDto,
-    transactionId: number,
-    modifierAdminId: number,
-  ) {
-    return this.mutexService.performExclusively(
-      `update-transaction-${transactionId}`,
-      async () => {
-        const { newStatus } = dto;
+                    if (transaction.status !== "PENDING") {
+                        throw new NotAcceptableException(
+                            "Transaction is not pending",
+                        );
+                    }
 
-        await this.repo.runTransaction(async (manager) => {
-          const transaction = await this.getTransactionById(transactionId);
+                    if (
+                        transaction.type !== TransactionType.DEPOSIT &&
+                        transaction.type !== TransactionType.WITHDRAWAL
+                    ) {
+                        throw new UnprocessableEntityException(
+                            "Transaction type is not valid",
+                        );
+                    }
 
-          if (isNil(transaction)) {
-            throw new NotFoundException('Transaction not found');
-          }
+                    const settings = await this.adminService.getSettings();
+                    const taxPercent = settings.taxPercent;
 
-          if (transaction.status !== 'PENDING') {
-            throw new NotAcceptableException('Transaction is not pending');
-          }
+                    const user = await this.usersService.findById(
+                        transaction.userId,
+                    );
+                    if (isNil(user)) {
+                        throw new NotFoundException("User not found");
+                    }
+                    if (newStatus === Status.APPROVED) {
+                        const txAmount = BigNumber(transaction.amount);
+                        const tax = txAmount
+                            .multipliedBy(taxPercent)
+                            .dividedBy(100);
 
-          if (
-            transaction.type !== TransactionType.DEPOSIT &&
-            transaction.type !== TransactionType.WITHDRAWAL
-          ) {
-            throw new UnprocessableEntityException(
-              'Transaction type is not valid',
-            );
-          }
+                        const net = txAmount.minus(tax);
 
-          const settings = await this.adminService.getSettings();
-          const taxPercent = settings.taxPercent;
+                        const newBalance =
+                            transaction.type === TransactionType.DEPOSIT
+                                ? new BigNumber(user.balance)
+                                      .plus(net)
+                                      .toFixed(2)
+                                : new BigNumber(user.balance)
+                                      .minus(net)
+                                      .toFixed(2);
 
-          const user = await this.usersService.findById(transaction.userId);
-          if (isNil(user)) {
-            throw new NotFoundException('User not found');
-          }
-          if (newStatus === Status.APPROVED) {
-            const txAmount = BigNumber(transaction.amount);
-            const tax = txAmount.multipliedBy(taxPercent).dividedBy(100);
+                        await this.usersService.updateBalance(
+                            user.id,
+                            newBalance,
+                            manager,
+                        );
 
-            const net = txAmount.minus(tax);
+                        const taxAmount = tax.toFixed(2);
+                        await this.updateTransaction(
+                            transactionId,
+                            {
+                                status: Status.APPROVED,
+                                taxAmount,
+                                modifierAdminId,
+                            },
+                            manager,
+                        );
+                        await this.generateTaxTransaction(
+                            user.id,
+                            taxAmount,
+                            transactionId,
+                            manager,
+                        );
+                    } else {
+                        await this.updateTransaction(
+                            transactionId,
+                            { status: Status.REJECTED, modifierAdminId },
+                            manager,
+                        );
+                    }
+                });
+            },
+        );
+    }
 
-            const newBalance =
-              transaction.type === TransactionType.DEPOSIT
-                ? new BigNumber(user.balance).plus(net).toFixed(2)
-                : new BigNumber(user.balance).minus(net).toFixed(2);
+    generateProfitTransaction(
+        userId: number,
+        amount: string,
+        roundId: number,
+        manager: EntityManager,
+    ) {
+        return this.repo.create(
+            {
+                type: TransactionType.PROFIT,
+                amount,
+                status: Status.COMPLETED,
+                sourceId: roundId,
+                userId,
+            },
+            { manager },
+        );
+    }
 
-            await this.usersService.updateBalance(user.id, newBalance, manager);
+    private generateTaxTransaction(
+        userId: number,
+        amount: string,
+        transactionId: number,
+        manager: EntityManager,
+    ) {
+        return this.repo.create(
+            {
+                type: TransactionType.TAX,
+                amount,
+                status: Status.COMPLETED,
+                sourceId: transactionId,
+                userId,
+            },
+            { manager },
+        );
+    }
 
-            const taxAmount = tax.toFixed(2);
-            await this.updateTransaction(
-              transactionId,
-              { status: Status.APPROVED, taxAmount, modifierAdminId },
-              manager,
-            );
-            await this.generateTaxTransaction(
-              user.id,
-              taxAmount,
-              transactionId,
-              manager,
-            );
-          } else {
-            await this.updateTransaction(
-              transactionId,
-              { status: Status.REJECTED, modifierAdminId },
-              manager,
-            );
-          }
-        });
-      },
-    );
-  }
-
-  generateProfitTransaction(
-    userId: number,
-    amount: string,
-    roundId: number,
-    manager: EntityManager,
-  ) {
-    return this.repo.create(
-      {
-        type: TransactionType.PROFIT,
-        amount,
-        status: Status.COMPLETED,
-        sourceId: roundId,
-        userId,
-      },
-      manager,
-    );
-  }
-
-  private generateTaxTransaction(
-    userId: number,
-    amount: string,
-    transactionId: number,
-    manager: EntityManager,
-  ) {
-    return this.repo.create(
-      {
-        type: TransactionType.TAX,
-        amount,
-        status: Status.COMPLETED,
-        sourceId: transactionId,
-        userId,
-      },
-      manager,
-    );
-  }
-
-  private updateTransaction(
-    transactionId: number,
-    dto: Partial<Transaction>,
-    manager: EntityManager,
-  ) {
-    return this.repo.updateById(transactionId, dto, manager);
-  }
+    private updateTransaction(
+        transactionId: number,
+        dto: Partial<Transaction>,
+        manager: EntityManager,
+    ) {
+        return this.repo.updateById(transactionId, dto, { manager });
+    }
 }
